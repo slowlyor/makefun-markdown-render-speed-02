@@ -1,27 +1,33 @@
-// main.ts — the driver the harness runs: node /bot/main.ts (Node 22).
+// Harness driver for markdown-render-speed-02.
 //
-// It reads every case from /input/cases.json (a JSON array of
-// {id, markdown}), renders each case on its own with parse() from
-// parse.js, and writes /output/html.json: a JSON array of the HTML
-// strings, one per case, in the cases' order. Outside a container,
-// MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input and
-// /output.
-//
-// The results go into a preallocated array by index rather than by
-// push: the array never grows, and the loop body is only the render.
+// Reads the case list (JSON array of { id, markdown }) from
+//   <inputDir>/cases.json     inputDir  = $MAKEFUN_INPUT_DIR  or /input
+// renders every case with parse() from ./parse.js, and writes the HTML
+// strings, in case order, as a JSON array to
+//   <outputDir>/html.json     outputDir = $MAKEFUN_OUTPUT_DIR or /output
 
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from './parse.js';
 
-const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const inputDir = process.env.MAKEFUN_INPUT_DIR || '/input';
+const outputDir = process.env.MAKEFUN_OUTPUT_DIR || '/output';
 
-const cases = JSON.parse(
-  readFileSync(join(INPUT_DIR, 'cases.json'), 'utf8'),
-) as { id: string; markdown: string }[];
+function main() {
+  const raw = readFileSync(join(inputDir, 'cases.json'), 'utf8');
+  const cases = JSON.parse(raw);
+  if (!Array.isArray(cases)) {
+    throw new Error('cases.json must contain a JSON array of cases');
+  }
+  const html = new Array(cases.length);
+  for (let i = 0; i < cases.length; i++) {
+    const entry = cases[i];
+    // Cases normally carry the source under .markdown; tolerate bare
+    // string entries so a differently-shaped case file still renders.
+    html[i] = parse(typeof entry === 'string' ? entry : entry.markdown);
+  }
+  mkdirSync(outputDir, { recursive: true });
+  writeFileSync(join(outputDir, 'html.json'), JSON.stringify(html));
+}
 
-const html: string[] = new Array(cases.length);
-for (let i = 0; i < cases.length; i++) html[i] = parse(cases[i].markdown);
-
-writeFileSync(join(OUTPUT_DIR, 'html.json'), JSON.stringify(html));
+main();

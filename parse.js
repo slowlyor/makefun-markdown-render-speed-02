@@ -1,147 +1,138 @@
-// parse.js — a faster drop-in for marked 18.1.3's marked.parse(markdown)
-// with marked's default options (gfm true, breaks false, pedantic false,
-// async false). parse(markdown) returns exactly the HTML marked returns.
+// Fast drop-in replacement for marked.parse (marked 18.1.3, vendored).
 //
-// Where the speed comes from:
-//
-// 1. One shared options object. marked.parse() rebuilds its options on
-//    every call, and the Lexer and Parser constructors then wire a fresh
-//    tokenizer and renderer into that throwaway object. The defaults never
-//    change here, so this module builds the options once and drives the
-//    vendored Lexer and Parser directly: the tokenizer and renderer are
-//    wired into the shared object a single time and every call after the
-//    first goes straight to lexing.
-//
-// 2. Provably trivial documents never reach the lexer at all (see
-//    plainDocument below). Everything the fast path cannot prove is
-//    rendered by marked itself, so the output there is marked's by
-//    construction.
+// Two ideas:
+//  1. marked.parse rebuilds its options object, tokenizer and renderer on
+//     every call. Building one shared options object up front and driving
+//     Lexer/Parser directly removes that per-call overhead while producing
+//     byte-identical output.
+//  2. A conservative fast path renders "plain" documents (only simple ATX
+//     headings and plain paragraphs) by hand. It returns null the moment
+//     anything looks even slightly non-plain, and the caller falls back to
+//     the real marked pipeline, so correctness never depends on the fast
+//     path being clever.
 
 import { Lexer, Parser, getDefaults } from './vendor/marked/marked.esm.js';
 
-// marked's defaults, built once: { async: false, breaks: false,
-// extensions: null, gfm: true, hooks: null, pedantic: false,
-// renderer: null, silent: false, tokenizer: null, walkTokens: null }.
-const options = getDefaults();
+// One options object for the whole process lifetime.
+const sharedOptions = getDefaults();
 
-/** Render with marked itself, on the shared options. */
-function render(markdown) {
-  return Parser.parse(Lexer.lex(markdown, options), options);
+function renderWithMarked(src) {
+  const tokens = Lexer.lex(src, sharedOptions);
+  return Parser.parse(tokens, sharedOptions);
 }
 
-// A document of nothing but spaces, tabs and line breaks lexes to space
-// tokens only, and space tokens render as the empty string.
-const whitespaceOnly = /^[\t\r\n ]*$/;
+// Fast path A: a document made only of spaces, tabs and line breaks renders
+// to the empty string in marked (no block tokens survive).
+const WHITESPACE_ONLY = /^[\t\r\n ]*$/;
 
-/**
- * The HTML marked renders for `markdown`, with marked's defaults.
- * @param {string} markdown
- * @returns {string}
- */
-export function parse(markdown) {
-  if (whitespaceOnly.test(markdown)) return '';
-  const fast = plainDocument(markdown);
-  return fast !== null ? fast : render(markdown);
+export function parse(src) {
+  if (typeof src !== 'string') {
+    return renderWithMarked(src);
+  }
+  if (WHITESPACE_ONLY.test(src)) {
+    return '';
+  }
+  const fast = tryPlainDocument(src);
+  if (fast !== null) {
+    return fast;
+  }
+  return renderWithMarked(src);
 }
 
-// ---------------------------------------------------------------------
-// The plain-document fast path.
+export default parse;
+
+// ---------------------------------------------------------------------------
+// Fast path B: plain documents.
 //
-// plainDocument(src) returns the HTML for src, or null when it cannot
-// prove the HTML. It fires only when every block of the document is one
-// of:
-//
-//   - an ATX heading whose text is plain (headingText below), or
-//   - a paragraph whose every line is plain (plainLine below),
-//
-// blocks being separated by truly empty lines. "Plain" text contains no
-// character that could start or alter any inline construct — no
-// backtick, asterisk, underscore, tilde, bracket, angle bracket,
-// ampersand, backslash or pipe — so marked's inline lexer would produce
-// a single text token for it, and marked's text escaping is the identity
-// on it: its text escaper rewrites only ampersands and numeric character
-// references, and the renderer escapes apostrophes, so both quote
-// characters are excluded too. GFM's extended autolinks are the other
-// trap in plain-looking text: a bare "www." host, a "://" URL or an
-// e-mail address would become a link, so any line that could autolink
-// is excluded by the substring guard in couldAutolink. A plain
-// paragraph line also cannot open or interrupt any block construct:
-// its first character is never a block marker (hash, angle,
-// list bullet, quote, fence, equals), it never starts with whitespace
-// or a tab, never ends with whitespace (no hard break, no setext
-// trick), and an ordered-list start is excluded by the digit rule.
-// ---------------------------------------------------------------------
+// A "plain" line is one that marked can only ever treat as literal paragraph
+// or heading text: it cannot open any block construct, cannot contain inline
+// markup, and cannot trigger GFM autolinking or HTML escaping differences.
+// If every block in the document is a plain ATX heading or a plain
+// paragraph, the HTML is mechanical. Anything else -> null -> marked.
+// ---------------------------------------------------------------------------
 
-const inlineSpecials = /[`*_~[\]<>&\\|'@"]/;
+// Characters that give a line inline meaning in markdown (emphasis, code,
+// links, images, escapes, strikethrough, raw HTML, entities, tables, smart
+// punctuation targets) or that marked autolinks / escapes specially.
+const FORBIDDEN_CHARS = /[`*_~\[\]<>&\\|'@"]/;
 
-// Substrings that GFM's extended autolinks turn into links even inside
-// otherwise plain text: a "www." host, a scheme URL, a mail or XMPP
-// address (an "@" is already excluded above; these are the rest).
-const autolinkShapes = /www\.|:\/\/|mailto:|xmpp:/i;
-
-/** Whether a line could grow a link the fast path would not render. */
-function couldAutolink(line) {
-  return autolinkShapes.test(line);
+// Char codes that, as the first character of a line, can open a block
+// construct (heading, blockquote, list, setext underline, HTML block, link
+// reference definition, code fence, thematic break via ~ or _ runs, ...).
+//   # 35   > 62   - 45   + 43   * 42   = 61   < 60   [ 91   ` 96   ~ 126   _ 95
+function isForbiddenFirst(code) {
+  return (
+    code === 35 || code === 62 || code === 45 || code === 43 ||
+    code === 42 || code === 61 || code === 60 || code === 91 ||
+    code === 96 || code === 126 || code === 95
+  );
 }
 
-/** A line of paragraph text marked can only render as literal text. */
-function plainLine(line) {
-  if (line === '' || line.trim() !== line) return false;
-  const first = line.charCodeAt(0);
-  // Block openers and interrupters: # > - + * = < [ ` ~ _
-  if (
-    first === 35 || first === 62 || first === 45 || first === 43 ||
-    first === 42 || first === 61 || first === 60 || first === 91 ||
-    first === 96 || first === 126 || first === 95
-  ) return false;
-  // An ordered list item ("1. ", "2) ", ...) can open a list.
-  if (first >= 48 && first <= 57 && /^\d{1,9}[.)] /.test(line)) return false;
-  return !inlineSpecials.test(line) && !couldAutolink(line);
+// Ordered-list item start, e.g. "1. " or "12) ".
+const ORDERED_LIST_START = /^\d{1,9}[.)] /;
+
+// Shapes marked's GFM autolinker turns into links even without brackets.
+const AUTOLINK_SHAPE = /www\.|:\/\/|mailto:|xmpp:/i;
+
+function isPlainLine(line) {
+  if (line.length === 0) return false;
+  // No leading/trailing whitespace: indentation can mean code blocks and
+  // trailing spaces can mean hard breaks.
+  if (line !== line.trim()) return false;
+  if (isForbiddenFirst(line.charCodeAt(0))) return false;
+  if (ORDERED_LIST_START.test(line)) return false;
+  if (FORBIDDEN_CHARS.test(line)) return false;
+  if (AUTOLINK_SHAPE.test(line)) return false;
+  return true;
 }
 
-/** The text of an ATX heading, plain in the same sense as plainLine. */
-function headingText(line) {
-  const match = /^(#{1,6}) (\S(?:.*\S)?)$/.exec(line);
-  if (match === null) return null;
-  const text = match[2];
-  // A trailing hash would be a closing sequence, which marked strips.
-  if (text.endsWith('#') || inlineSpecials.test(text) || couldAutolink(text)) return null;
-  return { level: match[1].length, text };
-}
+const HEADING_LINE = /^(#{1,6}) (\S(?:.*\S)?)$/;
 
-/**
- * The HTML of a document made only of plain paragraphs and ATX
- * headings, or null when any part of it is not provably plain.
- */
-function plainDocument(src) {
-  // marked normalises line endings before it lexes; do the same.
-  if (src.includes('\r')) src = src.replace(/\r\n|\r/g, '\n');
-  // A tab can indent a code block or a list item; never guess at one.
-  if (src.includes('\t')) return null;
-  const lines = src.split('\n');
-  let html = '';
-  let block = [];
-  const flush = () => {
-    if (block.length === 0) return true;
-    if (block.length === 1) {
-      const heading = headingText(block[0]);
-      if (heading !== null) {
-        html += `<h${heading.level}>${heading.text}</h${heading.level}>\n`;
-        block = [];
-        return true;
-      }
-    }
-    for (const line of block) if (!plainLine(line)) return false;
-    html += `<p>${block.join('\n')}</p>\n`;
-    block = [];
-    return true;
-  };
+function tryPlainDocument(src) {
+  // Normalise line endings the way marked does before lexing.
+  const text = src.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  // Tabs can expand into indentation (code blocks) or separate list
+  // markers; not worth modelling, so bail out entirely.
+  if (text.includes('\t')) return null;
+
+  const lines = text.split('\n');
+
+  // Group lines into blocks split by truly empty lines.
+  const blocks = [];
+  let current = [];
   for (const line of lines) {
     if (line === '') {
-      if (!flush()) return null;
+      if (current.length > 0) {
+        blocks.push(current);
+        current = [];
+      }
     } else {
-      block.push(line);
+      current.push(line);
     }
   }
-  return flush() ? html : null;
+  if (current.length > 0) blocks.push(current);
+  if (blocks.length === 0) return null;
+
+  let html = '';
+  for (const block of blocks) {
+    if (block.length === 1) {
+      const heading = HEADING_LINE.exec(block[0]);
+      if (heading) {
+        const headingText = heading[2];
+        // A trailing '#' run would be stripped by marked as a closing
+        // sequence, so such headings are not plain.
+        if (headingText.endsWith('#')) return null;
+        if (!isPlainLine(headingText)) return null;
+        const level = heading[1].length;
+        html += `<h${level}>${headingText}</h${level}>\n`;
+        continue;
+      }
+    }
+    // Paragraph block: every line must be plain.
+    for (const line of block) {
+      if (!isPlainLine(line)) return null;
+    }
+    html += `<p>${block.join('\n')}</p>\n`;
+  }
+  return html;
 }
