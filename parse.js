@@ -1,120 +1,140 @@
-// A faster drop-in for marked 18.1.3 (default options, GFM on).
+// parse.js — a faster drop-in for marked 18.1.3 (vendored in
+// vendor/marked, MIT — see vendor/marked/LICENSE and vendor/marked/NOTICE).
 //
-// Two ideas, neither of which changes a single output byte:
+// parse(markdown) returns exactly the HTML that marked.parse(markdown)
+// returns with marked's default options (gfm true, breaks false,
+// pedantic false, async false), for every input.
 //
-// 1. Drive the vendored Lexer and Parser directly on ONE shared options
-//    object. marked.parse() rebuilds its options on every call (two object
-//    spreads, a Marked-instance dispatch, hook plumbing that is all null
-//    under the defaults). With the defaults frozen, Lexer.lex(src, OPTS)
-//    followed by Parser.parse(tokens, OPTS) is exactly the same pipeline,
-//    minus the per-call rebuild. The vendored file does the rendering, so
-//    every edge case where marked departs from the spec still matches.
-//
-// 2. A fast path for documents that are provably plain: nothing in them
-//    can start a block or inline construct, so their HTML is known without
-//    lexing. Plain means: whitespace only, or a sequence of plain ATX
-//    headings and plain paragraphs separated by blank lines. The guards
-//    below reject anything that could render differently, including the
-//    GFM extended-autolink triggers (a "www." start, a "://" protocol, an
-//    "@" that could be an e-mail autolink, mailto:/xmpp: prefixes), every
-//    character that opens inline markup or an entity, list / setext /
-//    thematic-break / blockquote line shapes, indented code, hard breaks
-//    from trailing double spaces, and tabs. Text that survives the guards
-//    still goes through marked's own escaping, so an apostrophe comes out
-//    as &#39; and a double quote as &quot;, exactly as marked renders it.
-//    Anything rejected falls through to the full marked pipeline.
-//
-// vendor/marked is marked 18.1.3, MIT (see vendor/marked/LICENSE).
+// Two ideas make it faster than calling marked.parse:
+//  1. marked.parse rebuilds its options object on every call. Here the
+//     vendored Lexer and Parser are driven directly on ONE shared options
+//     object created once at module load, so the tokenizer, the renderer
+//     and the rule tables are built once and reused for every document.
+//  2. A document that is provably plain — nothing but blank lines, plain
+//     paragraphs and plain ATX headings, with no inline markup and no
+//     autolink material — is rendered by a small direct path that never
+//     lexes at all. Anything not provably plain falls through to the
+//     full marked pipeline below.
 
 import { Lexer, Parser, getDefaults } from './vendor/marked/marked.esm.js';
 
-// The one shared options object: marked's defaults, taken once.
-const OPTS = getDefaults();
+// The single options object every render shares. getDefaults() returns
+// marked's defaults (gfm true, breaks false, pedantic false, async
+// false, and no extensions, hooks, renderer, tokenizer or walkTokens),
+// and the Lexer and Parser attach their reusable tokenizer and renderer
+// to it the first time they run.
+const sharedOptions = getDefaults();
 
-// Characters and substrings that disqualify the fast path wherever they
-// appear: inline-markup openers, the entity opener, the autolink triggers,
-// a tab, and C0/DEL control characters other than the line feed.
-const NOT_PLAIN = /[\\`*_[\]<>&~|@\t\x00-\x08\x0b-\x1f\x7f]|\/\/|www\.|mailto:|xmpp:/i;
+// marked escapes exactly these characters in plain text, on top of the
+// ampersand its escape helper also handles. The plain path never lets
+// an ampersand through (it could begin an entity — see INLINE_DENY), so
+// these three are the whole of what escapePlainText has to do, and an
+// apostrophe becomes &#39; exactly as marked renders it.
+const ESCAPE_MAP = { '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
-// Block-level shapes a plain paragraph line may not have.
-const RE_BLANK = /^[ \t]*$/;
-const RE_HEADING = /^ {0,3}(#{1,6})(?:[ \t]+(.*))?$/;
-const RE_INDENTED = /^ {4}/;
-const RE_HARD_BREAK = / {2,}$/;
-const RE_LIST_ITEM = /^ {0,3}(?:[-+]|\d{1,9}[.)])(?:[ \t]|$)/;
-const RE_DASH_ONLY = /^ {0,3}-+[ \t]*$/;
-const RE_DASH_BREAK = /^ {0,3}(?:-[ \t]*){3,}$/;
-const RE_PLUS_ONLY = /^ {0,3}\++[ \t]*$/;
-const RE_EQUALS_ONLY = /^ {0,3}=+[ \t]*$/;
-const RE_BLOCKQUOTE = /^ {0,3}>/;
-const RE_TRAILING_PAD = /[ \t]+$/;
-
-const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-
-function escapePlain(text) {
-  return text.replace(/[&<>"']/g, (ch) => ESCAPES[ch]);
+function escapePlainText(text) {
+  return text.replace(/[>"']/g, (ch) => ESCAPE_MAP[ch]);
 }
 
-// The HTML of a provably plain document, or null when the document is not
-// provably plain and must go through marked.
-function plainHtml(src) {
-  if (src.indexOf('\r') !== -1) src = src.replace(/\r\n?/g, '\n');
-  if (NOT_PLAIN.test(src)) return null;
+// Characters that can open an inline construct (a code span, emphasis,
+// strong emphasis, a link, an image, inline HTML, an entity or a
+// backslash escape) or take part in one, plus the control characters
+// other than the line feed that separates lines. A plain run of text
+// contains none of them.
+const INLINE_DENY = /[`*_[\]()<&\\\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/;
 
-  const lines = src.split('\n');
+function isPlainText(text) {
+  return !INLINE_DENY.test(text);
+}
+
+// A line of a plain paragraph: plain text that also cannot start or
+// become some other block. Lines that could interrupt a paragraph as
+// an ATX heading are classified by the caller before this is consulted.
+function isPlainParagraphLine(line) {
+  const first = line[0];
+  // A leading space could be an indented code block; a > is a block
+  // quote; a - is a list item, a setext underline or a thematic break.
+  if (first === ' ' || first === '>' || first === '-') return false;
+  // A + followed by a space starts a bullet list item.
+  if (first === '+' && line[1] === ' ') return false;
+  // 1. or 1) followed by a space or the end of the line is a list item.
+  if (/^\d{1,9}[.)](?: |$)/.test(line)) return false;
+  // A line of nothing but = signs is a setext heading underline.
+  if (/^=+$/.test(line.replace(/ +$/, ''))) return false;
+  // A line of nothing but pipes, colons, dashes and spaces that holds
+  // a dash is a table delimiter row.
+  if (line.includes('-') && /^[|:\- ]+$/.test(line)) return false;
+  // Two or more trailing spaces are a hard line break.
+  if (/ {2}$/.test(line)) return false;
+  return isPlainText(line);
+}
+
+// Render a provably plain document directly, or return null when the
+// document is not provably plain and marked itself must render it.
+function renderPlainDocument(src) {
+  // Tabs and carriage returns change how marked lexes (indented code
+  // blocks, line-ending normalisation), so any document holding one
+  // belongs to the full pipeline.
+  if (src.includes('\t') || src.includes('\r')) return null;
+  // GFM autolinks and extended autolinks never take this path: a
+  // document holding www., a scheme's ://, an @ that could sit in an
+  // email address, or a mailto: or xmpp: scheme is never plain,
+  // however innocent the rest of it looks. ~~ opens a strikethrough.
+  if (src.includes('@') || src.includes('://') || src.includes('~~')) return null;
+  const lowered = src.toLowerCase();
+  if (lowered.includes('www.') || lowered.includes('mailto:') || lowered.includes('xmpp:')) return null;
+
   let out = '';
-  let para = [];
-
-  const flushPara = () => {
-    if (para.length > 0) {
-      out += '<p>' + escapePlain(para.join('\n')) + '</p>\n';
-      para = [];
+  let paragraph = null;
+  const flushParagraph = () => {
+    if (paragraph !== null) {
+      out += '<p>' + paragraph.map(escapePlainText).join('\n') + '</p>\n';
+      paragraph = null;
     }
   };
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    if (RE_BLANK.test(line)) {
-      flushPara();
+  for (const line of src.split('\n')) {
+    if (line === '' || /^ +$/.test(line)) {
+      flushParagraph();
       continue;
     }
-
-    const heading = RE_HEADING.exec(line);
+    const heading = /^(#{1,6})(?: +(.*))?$/.exec(line);
     if (heading !== null) {
-      const text = (heading[2] ?? '').replace(RE_TRAILING_PAD, '');
-      // A '#' in the text could be a closing sequence; let marked decide.
-      if (text.indexOf('#') !== -1) return null;
-      flushPara();
-      const level = heading[1].length;
-      out += '<h' + level + '>' + escapePlain(text) + '</h' + level + '>\n';
+      // Drop trailing spaces, then a closing run of # signs (one that
+      // is the whole text, or one set off by a space) as marked does.
+      let text = (heading[2] ?? '').replace(/ +$/, '');
+      if (/^#+$/.test(text)) text = '';
+      else text = text.replace(/ +#+$/, '');
+      if (!isPlainText(text)) return null;
+      flushParagraph();
+      const depth = heading[1].length;
+      out += '<h' + depth + '>' + escapePlainText(text) + '</h' + depth + '>\n';
       continue;
     }
-
-    // A paragraph line. Reject every shape that could start (or, as a
-    // continuation line, become) another construct.
-    if (RE_INDENTED.test(line)) return null;
-    if (RE_HARD_BREAK.test(line)) return null;
-    if (RE_LIST_ITEM.test(line)) return null;
-    if (RE_BLOCKQUOTE.test(line)) return null;
-    if (RE_DASH_ONLY.test(line)) return null;
-    if (RE_DASH_BREAK.test(line)) return null;
-    if (RE_PLUS_ONLY.test(line)) return null;
-    // A line of '=' is setext underline only under paragraph text; as the
-    // first line of a block it is ordinary paragraph text.
-    if (para.length > 0 && RE_EQUALS_ONLY.test(line)) return null;
-
-    para.push(line);
+    // A line opening with # that is no ATX heading is not plain.
+    if (line[0] === '#') return null;
+    if (!isPlainParagraphLine(line)) return null;
+    if (paragraph === null) paragraph = [];
+    paragraph.push(line);
   }
-  flushPara();
+  flushParagraph();
   return out;
 }
 
 /** The HTML marked renders for `markdown`, with marked's defaults. */
 export function parse(markdown) {
-  if (typeof markdown === 'string') {
-    const fast = plainHtml(markdown);
-    if (fast !== null) return fast;
+  if (typeof markdown !== 'string') {
+    const what = markdown === undefined || markdown === null
+      ? 'input parameter is undefined or null'
+      : 'input parameter is of type ' + Object.prototype.toString.call(markdown) + ', string expected';
+    throw new Error('marked(): ' + what + '\nPlease report this to https://github.com/markedjs/marked.');
   }
-  return Parser.parse(Lexer.lex(markdown, OPTS), OPTS);
+  // Whitespace alone renders as the empty string, tabs and all.
+  if (/^[ \t\r\n]*$/.test(markdown)) return '';
+  const plain = renderPlainDocument(markdown);
+  if (plain !== null) return plain;
+  // The full pipeline, on the one shared options object: with marked's
+  // defaults there are no hooks to run and no tokens to walk, so lexing
+  // and parsing are the whole of what marked.parse would do.
+  return Parser.parse(Lexer.lex(markdown, sharedOptions), sharedOptions);
 }
