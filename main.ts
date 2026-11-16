@@ -1,33 +1,27 @@
-// Harness driver for markdown-render-speed-02.
+// Driver for the markdown-render-speed-02 entry.
 //
-// Reads the case list (JSON array of { id, markdown }) from
-//   <inputDir>/cases.json     inputDir  = $MAKEFUN_INPUT_DIR  or /input
-// renders every case with parse() from ./parse.js, and writes the HTML
-// strings, in case order, as a JSON array to
-//   <outputDir>/html.json     outputDir = $MAKEFUN_OUTPUT_DIR or /output
+// The harness runs `node /bot/main.ts` (Node 22, which strips TypeScript
+// types natively). It reads every case from /input/cases.json — a JSON
+// array of {id, markdown} — renders each markdown string with parse()
+// from parse.js, and writes /output/html.json: a JSON array of the HTML
+// strings, one per case, in the cases' order. Outside a container,
+// MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input and
+// /output so the same driver can be run locally.
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from './parse.js';
 
-const inputDir = process.env.MAKEFUN_INPUT_DIR || '/input';
-const outputDir = process.env.MAKEFUN_OUTPUT_DIR || '/output';
+const inputDir: string = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+const outputDir: string = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-function main() {
-  const raw = readFileSync(join(inputDir, 'cases.json'), 'utf8');
-  const cases = JSON.parse(raw);
-  if (!Array.isArray(cases)) {
-    throw new Error('cases.json must contain a JSON array of cases');
-  }
-  const html = new Array(cases.length);
-  for (let i = 0; i < cases.length; i++) {
-    const entry = cases[i];
-    // Cases normally carry the source under .markdown; tolerate bare
-    // string entries so a differently-shaped case file still renders.
-    html[i] = parse(typeof entry === 'string' ? entry : entry.markdown);
-  }
-  mkdirSync(outputDir, { recursive: true });
-  writeFileSync(join(outputDir, 'html.json'), JSON.stringify(html));
+const cases: { id: string; markdown: string }[] = JSON.parse(
+  readFileSync(join(inputDir, 'cases.json'), 'utf8'),
+);
+
+const html: string[] = new Array(cases.length);
+for (let i = 0; i < cases.length; i++) {
+  html[i] = parse(cases[i].markdown);
 }
 
-main();
+writeFileSync(join(outputDir, 'html.json'), JSON.stringify(html));
