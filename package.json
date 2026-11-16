@@ -1,3 +1,1 @@
-{
-  "type": "module"
-}
+{"description":"A faster drop-in for marked 18.1.3: parse.js returns exactly the HTML marked.parse returns with marked's defaults.","license":"MIT","main":"parse.js","name":"makefun-markdown-render-speed-02","type":"module","version":"1.0.0"}
